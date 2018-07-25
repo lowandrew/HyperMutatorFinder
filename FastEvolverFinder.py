@@ -5,7 +5,13 @@ import subprocess
 import argparse
 import shutil
 import pysam
+import math
 import os
+
+
+# Don't think this will actually get used. Cleanup.
+def phred_to_probability(phred_score):
+    return 1 - math.pow(10, int(phred_score) * -0.1)
 
 
 def trim(forward_reads, reverse_reads, outdir):
@@ -21,10 +27,23 @@ def trim(forward_reads, reverse_reads, outdir):
 
 def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
     # Map with bbmap default settings. This may or may not work.
+    # Getting some real weird results with this - try using bowtie2 and see what happens
+    # Bowtie2 gives really similar results with default settings. Will need to play with parameters lots tomorrow to
+    # try to figure out what's going on.
+
     bbtools.bbmap(reference=reference_fasta,
                   forward_in=forward_reads,
                   reverse_in=reverse_reads,
-                  out_bam=os.path.join(outdir, 'aligned.bam'))
+                  out_bam=os.path.join(outdir, 'aligned.bam'),
+                  subfilter=1)  # Limiting to one substitution allowed per read mapped might help - TBD
+    # cmd = 'bowtie2-build {reference_fasta} {reference_fasta}'.format(reference_fasta=reference_fasta)
+    # subprocess.call(cmd, shell=True)
+    # cmd = 'bowtie2 -p 12 -x {reference_fasta} -1 {forward_reads} -2 {reverse_reads} | samtools ' \
+    #       'view -bS > {bam}'.format(reference_fasta=reference_fasta,
+    #                                 forward_reads=forward_reads,
+    #                                 reverse_reads=reverse_reads,
+    #                                 bam=os.path.join(outdir, 'aligned.bam'))
+    # subprocess.call(cmd, shell=True)
     # Also sort and index the bamfile so pysam will be happy with us.
     cmd = 'samtools sort {bamfile} -o {sorted_bamfile}'.format(bamfile=os.path.join(outdir, 'aligned.bam'),
                                                                sorted_bamfile=os.path.join(outdir, 'aligned_sorted.bam'))
@@ -33,30 +52,56 @@ def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
     subprocess.call(cmd, shell=True)
 
 
+def has_two_high_quality_bases(list_of_scores):
+    quality_bases_count = 0
+    for score in list_of_scores:
+        if score >= 35:
+            quality_bases_count += 1
+        if quality_bases_count >= 2:
+            return True
+    return False
+
+
 def find_if_multibase(column):
-    # Try with 3 percent cutoff, only 2 bases present?
     base_dict = dict()
+    # TODO: Sometimes the qualities come out to ridiculously high (>70) values. I didn't think we ever saw quality
+    # values that high. Need to look into it to see if the values we're given by pysam need to be offset sometimes
+    base_qualities = dict()
     for read in column.pileups:
         if read.query_position is not None:  # Not entirely sure why this is sometimes None, but it causes bad stuff
             base = read.alignment.query_sequence[read.query_position]
+            quality = read.alignment.query_qualities[read.query_position]
+            if base not in base_qualities:
+                base_qualities[base] = [quality]
+            else:
+                base_qualities[base].append(quality)
             if base in base_dict:
                 base_dict[base] += 1
             else:
                 base_dict[base] = 1
-    # Assume that things that are truly indicative of fast evolution at least 10 percent of population?
-    # Assume things that only have count of 1 are sequencing errors. TODO: See if we can get quality to inform this.
+    # Assume that things that are truly indicative of fast evolution at least 20 percent of population?
+    # This parameter may bear lots of playing
+    # Assume things that only have count of 1 are sequencing errors.
     appropriate_ratio = True
     if len(base_dict) == 1:
         appropriate_ratio = False
     for base in base_dict:
-        if base_dict[base]/column.n >= 0.9 or base_dict[base]/column.n <= 0.1 or base_dict[base] == 1:
+        if base_dict[base]/column.n >= 0.8 or base_dict[base]/column.n <= 0.2 or base_dict[base] == 1:
             appropriate_ratio = False
-    # if appropriate_ratio:
-    #     print(base_dict, end=' ')
-    #     print(column.pos, end=' ')
-    #     print(column.reference_name)
     if appropriate_ratio is False:
         base_dict = dict()
+    # At this point we know that bases are in an appropriate(ish) ratio.
+    # Now check that at least two bases for each of the bases present are very high (>35) quality.
+    if base_dict:
+        high_quality_bases = True
+        print(base_dict)
+        print(base_qualities)
+        for base in base_qualities:
+            if has_two_high_quality_bases(base_qualities[base]) is False:
+                high_quality_bases = False
+            print(has_two_high_quality_bases(base_qualities[base]))
+        if high_quality_bases is False:
+            base_dict = dict()
     return base_dict
 
 
