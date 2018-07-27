@@ -117,10 +117,22 @@ def base_dict_to_string(base_dict):
     return outstr[:-1]
 
 
+def get_average_coverage(bamfile, contig_name):
+    arrays = bamfile.count_coverage(contig=contig_name)
+    list_of_arrays = list()
+    for array in arrays:
+        list_of_arrays.append(array)
+    # Courtesy of: https://stackoverflow.com/questions/14050824/add-sum-of-values-of-two-lists-into-new-list
+    summed_list = [sum(x) for x in zip(*list_of_arrays)]
+    mean_coverage = sum(summed_list)/len(summed_list)
+    return mean_coverage
+
+
 def read_contig(contig_name, bamfile_name, reference_fasta):
     bamfile = pysam.AlignmentFile(bamfile_name, 'rb')
     multibase_position_dict = dict()
     lines_to_write = list()
+    average_coverage = get_average_coverage(bamfile, contig_name)
     # THese parameters seem to be fairly undocumented with pysam, but I think that they should make the output
     # that I'm getting to match up with what I'm seeing in Tablet.
     for column in bamfile.pileup(contig_name,
@@ -132,7 +144,11 @@ def read_contig(contig_name, bamfile_name, reference_fasta):
                 multibase_position_dict[column.reference_name].append(column.pos)
             else:
                 multibase_position_dict[column.reference_name] = [column.pos]
-            lines_to_write.append('{},{},{}\n'.format(column.reference_name, column.pos, base_dict_to_string(base_dict)))
+            lines_to_write.append('{},{},{},{},{}\n'.format(column.reference_name,
+                                                            column.pos,
+                                                            base_dict_to_string(base_dict),
+                                                            average_coverage,
+                                                            sum(base_dict.values())))
     bamfile.close()
     return lines_to_write
 
@@ -148,7 +164,7 @@ def read_bamfile(sorted_bamfile, outfile, reference_fasta):
     pool.close()
     pool.join()
     with open(outfile, 'w') as f:
-        f.write('Contig,Position,Bases\n')
+        f.write('Contig,Position,Bases,ReadCoverage,BaseCoverage\n')
         for item in contig_multi_info:
             for line in item:
                 f.write(line)
@@ -160,12 +176,14 @@ def filter_close_snvs(details_file, outfile):
         lines = details.readlines()
 
     with open(outfile, 'w') as f:
-        f.write('Contig,Position,Bases,Status\n')
+        f.write('Contig,Position,Bases,ReadCoverage,BaseCoverage,Status\n')
         for i in range(1, len(lines)):
             current_line = lines[i].rstrip().split(',')
             current_contig = current_line[0]
             current_position = current_line[1]
             current_bases = current_line[2]
+            current_read_coverage = float(current_line[3])
+            current_base_coverage = float(current_line[4])
             # Have to check each line against next and previous lines. Special cases for next and previous at end/
             # beginning of file
             if i < len(lines) - 1:
@@ -197,11 +215,26 @@ def filter_close_snvs(details_file, outfile):
                 if current_contig == previous_contig and (int(current_position) - int(previous_position)) < 500:
                     valid = False
 
+            # Also: check that base coverage isn't significantly (1.5X?) more than average coverage.
+            # Can indicate that two (or more) slightly different genes have been assembled into one by SPAdes
+            if current_base_coverage/current_read_coverage > 1.5:
+                valid = False
+
             if valid:
                 multi_positions += 1
-                f.write('{},{},{},{}\n'.format(current_contig, current_position, current_bases, 'Valid'))
+                f.write('{},{},{},{},{},{}\n'.format(current_contig,
+                                                     current_position,
+                                                     current_bases,
+                                                     current_read_coverage,
+                                                     current_base_coverage,
+                                                     'Valid'))
             else:
-                f.write('{},{},{},{}\n'.format(current_contig, current_position, current_bases, 'Filtered'))
+                f.write('{},{},{},{},{},{}\n'.format(current_contig,
+                                                     current_position,
+                                                     current_bases,
+                                                     current_read_coverage,
+                                                     current_base_coverage,
+                                                     'Filtered'))
 
     return multi_positions
 
