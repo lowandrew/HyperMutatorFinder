@@ -8,6 +8,7 @@ import pysam
 import math
 import os
 
+# TODO: Assemblies with spaces in headers cause problems. Make sure that gets fixed.
 
 # Don't think this will actually get used. Cleanup.
 def phred_to_probability(phred_score):
@@ -31,19 +32,14 @@ def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
     # Bowtie2 gives really similar results with default settings. Will need to play with parameters lots tomorrow to
     # try to figure out what's going on.
 
+    cmd = 'samtools faidx {reference_fasta}'.format(reference_fasta=reference_fasta)
+    subprocess.call(cmd, shell=True)
+
     bbtools.bbmap(reference=reference_fasta,
                   forward_in=forward_reads,
                   reverse_in=reverse_reads,
                   out_bam=os.path.join(outdir, 'aligned.bam'),
                   subfilter=1)  # Limiting to one substitution allowed per read mapped might help - TBD
-    # cmd = 'bowtie2-build {reference_fasta} {reference_fasta}'.format(reference_fasta=reference_fasta)
-    # subprocess.call(cmd, shell=True)
-    # cmd = 'bowtie2 -p 12 -x {reference_fasta} -1 {forward_reads} -2 {reverse_reads} | samtools ' \
-    #       'view -bS > {bam}'.format(reference_fasta=reference_fasta,
-    #                                 forward_reads=forward_reads,
-    #                                 reverse_reads=reverse_reads,
-    #                                 bam=os.path.join(outdir, 'aligned.bam'))
-    # subprocess.call(cmd, shell=True)
     # Also sort and index the bamfile so pysam will be happy with us.
     cmd = 'samtools sort {bamfile} -o {sorted_bamfile}'.format(bamfile=os.path.join(outdir, 'aligned.bam'),
                                                                sorted_bamfile=os.path.join(outdir, 'aligned_sorted.bam'))
@@ -64,8 +60,8 @@ def has_two_high_quality_bases(list_of_scores):
 
 def find_if_multibase(column):
     base_dict = dict()
-    # TODO: Sometimes the qualities come out to ridiculously high (>70) values. I didn't think we ever saw quality
-    # values that high. Need to look into it to see if the values we're given by pysam need to be offset sometimes
+    # TODO: Sometimes the qualities come out to ridiculously high (>70) values. Looks to be because sometimes reads
+    # are overlapping and the qualities get summed for overlapping bases. Issue opened on pysam.
     base_qualities = dict()
     for read in column.pileups:
         if read.query_position is not None:  # Not entirely sure why this is sometimes None, but it causes bad stuff
@@ -94,12 +90,9 @@ def find_if_multibase(column):
     # Now check that at least two bases for each of the bases present are very high (>35) quality.
     if base_dict:
         high_quality_bases = True
-        print(base_dict)
-        print(base_qualities)
         for base in base_qualities:
             if has_two_high_quality_bases(base_qualities[base]) is False:
                 high_quality_bases = False
-            print(has_two_high_quality_bases(base_qualities[base]))
         if high_quality_bases is False:
             base_dict = dict()
     return base_dict
@@ -112,9 +105,9 @@ def base_dict_to_string(base_dict):
     return outstr[:-1]
 
 
-def read_bamfile(sorted_bamfile, outfile):
+def read_bamfile(sorted_bamfile, outfile, reference_fasta):
     multi_base_positions = 0
-    bamfile = pysam.Samfile(sorted_bamfile, 'rb')
+    bamfile = pysam.AlignmentFile(sorted_bamfile, 'rb')
     # TODO: Figure out if the multiprocessing is actually possible. Currently don't think it is due to some
     # limitation with pysam
     # pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
@@ -124,7 +117,10 @@ def read_bamfile(sorted_bamfile, outfile):
     with open(outfile, 'w') as f:
         f.write('Contig,Position,Bases\n')
         multibase_position_dict = dict()
-        for column in bamfile.pileup():
+        # THese parameters seem to be fairly undocumented with pysam, but I think that they should make the output
+        # that I'm getting to match up with what I'm seeing in Tablet.
+        for column in bamfile.pileup(stepper='samtools', ignore_orphans=False, fastafile=pysam.FastaFile(reference_fasta),
+                                     min_base_quality=0):
             base_dict = find_if_multibase(column)
             if base_dict:
                 multi_base_positions += 1
@@ -133,13 +129,7 @@ def read_bamfile(sorted_bamfile, outfile):
                 else:
                     multibase_position_dict[column.reference_name] = [column.pos]
                 f.write('{},{},{}\n'.format(column.reference_name, column.pos, base_dict_to_string(base_dict)))
-            # if total_genome_length % 200000 == 0:  # Give me some sporadic updates.
-            #     print('Genome length ' + str(total_genome_length))
-            #     print('Multi base positions ' + str(multi_base_positions))
     bamfile.close()
-    # print('Genome length ' + str(total_genome_length))
-    # print('Multi base positions ' + str(multi_base_positions))
-    # print(multibase_position_dict)
     return multibase_position_dict
 
 
@@ -238,7 +228,8 @@ def main():
     # 3) Parse through each position of the BAM file and find sites that are heterogenous-ish, indicating the colony
     # was evolving quickly.
     multi_position_dict = read_bamfile(sorted_bamfile=os.path.join(args.outdir, 'aligned_sorted.bam'),
-                                       outfile=os.path.join(args.outdir, 'details.csv'))
+                                       outfile=os.path.join(args.outdir, 'details.csv'),
+                                       reference_fasta=args.assembly)
 
     # This gets us a list of sites that are appropriately heterogenous (pending me figuring out what cutoffs should
     # actually be getting used). A lot of these sites tend to cluster together - my interpretation is that this is
