@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 from biotools import bbtools
+import multiprocessing
+from Bio import SeqIO
 import subprocess
 import argparse
 import shutil
@@ -9,6 +11,9 @@ import math
 import os
 
 # TODO: Assemblies with spaces in headers cause problems. Make sure that gets fixed.
+# Also, all of this may or may not be doable (and much faster) with regular SNP callers. Look into bcftools/etc
+# and see what you can find.
+
 
 # Don't think this will actually get used. Cleanup.
 def phred_to_probability(phred_score):
@@ -98,6 +103,13 @@ def find_if_multibase(column):
     return base_dict
 
 
+def get_contig_names(fasta_file):
+    contig_names = list()
+    for contig in SeqIO.parse(fasta_file, 'fasta'):
+        contig_names.append(contig.id)
+    return contig_names
+
+
 def base_dict_to_string(base_dict):
     outstr = ''
     for base in base_dict:
@@ -105,32 +117,41 @@ def base_dict_to_string(base_dict):
     return outstr[:-1]
 
 
+def read_contig(contig_name, bamfile_name, reference_fasta):
+    bamfile = pysam.AlignmentFile(bamfile_name, 'rb')
+    multibase_position_dict = dict()
+    lines_to_write = list()
+    # THese parameters seem to be fairly undocumented with pysam, but I think that they should make the output
+    # that I'm getting to match up with what I'm seeing in Tablet.
+    for column in bamfile.pileup(contig_name,
+                                 stepper='samtools', ignore_orphans=False, fastafile=pysam.FastaFile(reference_fasta),
+                                 min_base_quality=0):
+        base_dict = find_if_multibase(column)
+        if base_dict:
+            if column.reference_name in multibase_position_dict:
+                multibase_position_dict[column.reference_name].append(column.pos)
+            else:
+                multibase_position_dict[column.reference_name] = [column.pos]
+            lines_to_write.append('{},{},{}\n'.format(column.reference_name, column.pos, base_dict_to_string(base_dict)))
+    bamfile.close()
+    return lines_to_write
+
+
 def read_bamfile(sorted_bamfile, outfile, reference_fasta):
-    multi_base_positions = 0
-    bamfile = pysam.AlignmentFile(sorted_bamfile, 'rb')
-    # TODO: Figure out if the multiprocessing is actually possible. Currently don't think it is due to some
-    # limitation with pysam
-    # pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
-    # multibase = pool.imap(find_if_multibase, bamfile.pileup(), chunksize=1000)
-    # pool.close()
-    # pool.join()
+    contig_names = get_contig_names(reference_fasta)
+    # Make a threads option eventually!
+    pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+    bamfile_list = [sorted_bamfile] * len(contig_names)
+    reference_fasta_list = [reference_fasta] * len(contig_names)
+    # Name this better!
+    contig_multi_info = pool.starmap(read_contig, zip(contig_names, bamfile_list, reference_fasta_list))
+    pool.close()
+    pool.join()
     with open(outfile, 'w') as f:
         f.write('Contig,Position,Bases\n')
-        multibase_position_dict = dict()
-        # THese parameters seem to be fairly undocumented with pysam, but I think that they should make the output
-        # that I'm getting to match up with what I'm seeing in Tablet.
-        for column in bamfile.pileup(stepper='samtools', ignore_orphans=False, fastafile=pysam.FastaFile(reference_fasta),
-                                     min_base_quality=0):
-            base_dict = find_if_multibase(column)
-            if base_dict:
-                multi_base_positions += 1
-                if column.reference_name in multibase_position_dict:
-                    multibase_position_dict[column.reference_name].append(column.pos)
-                else:
-                    multibase_position_dict[column.reference_name] = [column.pos]
-                f.write('{},{},{}\n'.format(column.reference_name, column.pos, base_dict_to_string(base_dict)))
-    bamfile.close()
-    return multibase_position_dict
+        for item in contig_multi_info:
+            for line in item:
+                f.write(line)
 
 
 def filter_close_snvs(details_file, outfile):
@@ -227,9 +248,9 @@ def main():
                outdir=args.outdir)
     # 3) Parse through each position of the BAM file and find sites that are heterogenous-ish, indicating the colony
     # was evolving quickly.
-    multi_position_dict = read_bamfile(sorted_bamfile=os.path.join(args.outdir, 'aligned_sorted.bam'),
-                                       outfile=os.path.join(args.outdir, 'details.csv'),
-                                       reference_fasta=args.assembly)
+    read_bamfile(sorted_bamfile=os.path.join(args.outdir, 'aligned_sorted.bam'),
+                 outfile=os.path.join(args.outdir, 'details.csv'),
+                 reference_fasta=args.assembly)
 
     # This gets us a list of sites that are appropriately heterogenous (pending me figuring out what cutoffs should
     # actually be getting used). A lot of these sites tend to cluster together - my interpretation is that this is
