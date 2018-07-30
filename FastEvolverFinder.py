@@ -89,7 +89,7 @@ def find_if_multibase(column):
     empty dictionary
     """
     base_dict = dict()
-    # TODO: Sometimes the qualities come out to ridiculously high (>70) values. Looks to be because sometimes reads
+    # Sometimes the qualities come out to ridiculously high (>70) values. Looks to be because sometimes reads
     # are overlapping and the qualities get summed for overlapping bases. Issue opened on pysam.
     base_qualities = dict()
     for read in column.pileups:
@@ -105,7 +105,6 @@ def find_if_multibase(column):
             else:
                 base_dict[base] = 1
     # Assume that things that are truly indicative of fast evolution at least 20 percent of population?
-    # This parameter may bear lots of playing
     # Assume things that only have count of 1 are sequencing errors.
     appropriate_ratio = True
     if len(base_dict) == 1:
@@ -207,7 +206,7 @@ def read_bamfile(sorted_bamfile, outfile, reference_fasta):
                 f.write(line)
 
 
-def filter_close_snvs(details_file, outfile):
+def filter_close_snvs(details_file, outfile, snv_window_size, coverage_filter, min_coverage):
     multi_positions = 0
     with open(details_file) as details:
         lines = details.readlines()
@@ -236,26 +235,36 @@ def filter_close_snvs(details_file, outfile):
             else:
                 previous_contig = None
             # The case for the vast majority of the file - line is between two others.
+            filter_reason = ''
             valid = True
             if next_contig is not None and previous_contig is not None:
                 # Check validity: Current postion can't be on same contig and within 500 bases as next or previous
-                if current_contig == next_contig and (int(next_position) - int(current_position)) < 500:
+                if current_contig == next_contig and (int(next_position) - int(current_position)) < snv_window_size:
                     valid = False
-                elif current_contig == previous_contig and (int(current_position) - int(previous_position)) < 500:
+                    filter_reason = 'SNVDensity'
+                elif current_contig == previous_contig and (int(current_position) - int(previous_position)) < snv_window_size:
                     valid = False
+                    filter_reason = 'SNVDensity'
             # When we're on first line of file, only need to check if next position, as previous doesn't exist.
             elif previous_contig is None and next_contig is not None:
-                if current_contig == next_contig and (int(next_position) - int(current_position)) < 500:
+                if current_contig == next_contig and (int(next_position) - int(current_position)) < snv_window_size:
                     valid = False
+                    filter_reason = 'SNVDensity'
             # Final case: last line of file
             elif previous_contig is not None and next_contig is None:
-                if current_contig == previous_contig and (int(current_position) - int(previous_position)) < 500:
+                if current_contig == previous_contig and (int(current_position) - int(previous_position)) < snv_window_size:
                     valid = False
+                    filter_reason = 'SNVDensity'
 
-            # Also: check that base coverage isn't significantly (1.5X?) more than average coverage.
+            # Also: check that base coverage isn't significantly (1.5X by default) more than average coverage.
             # Can indicate that two (or more) slightly different genes have been assembled into one by SPAdes
-            if current_base_coverage/current_read_coverage > 1.5:
+            if current_base_coverage/current_read_coverage > coverage_filter:
                 valid = False
+                filter_reason = 'CoverageHigh'
+
+            if current_base_coverage < min_coverage:
+                valid = False
+                filter_reason = 'CoverageLow'
 
             if valid:
                 multi_positions += 1
@@ -271,7 +280,7 @@ def filter_close_snvs(details_file, outfile):
                                                      current_bases,
                                                      current_read_coverage,
                                                      current_base_coverage,
-                                                     'Filtered'))
+                                                     'Filtered-' + filter_reason))
 
     return multi_positions
 
@@ -282,7 +291,9 @@ def main():
     parser.add_argument('-a', '--assembly',
                         type=str,
                         required=True,
-                        help='Full path to your FASTA-formatted assembly.')
+                        help='Full path to your FASTA-formatted assembly. Only works with SPAdes assemblies right now.'
+                             ' SKESA causes breakpoints at most sites we\'re looking for. Other assemblers have'
+                             ' not been tested.')
     parser.add_argument('-1', '--forward_reads',
                         type=str,
                         required=True,
@@ -295,11 +306,29 @@ def main():
                         type=str,
                         required=True,
                         help='Output directory. Must not currently exist.')
+    parser.add_argument('-m', '--min_coverage',
+                        default=10,
+                        type=int,
+                        help='Minimum amount of coverage a site must have before it will be considered for analysis. '
+                             'Defaults to 10.')
+    parser.add_argument('-w', '--filter_density_window',
+                        default=500,
+                        type=int,
+                        help='Window size for identifying high-density SNV regions that will be discarded from '
+                             'analysis. Defaults to 500, meaning any region of 500 or fewer base pairs with more than '
+                             'one SNV will not be considered.')
+    parser.add_argument('-c', '--coverage_filter',
+                        type=float,
+                        default=1.5,
+                        help='Filter for coverage - sites that look heterogenous but have higher than average '
+                             'coverage usually result from two genes that are very close to identical that get '
+                             'merged into one by SPAdes. This filter stops that. Defaults to discarding if coverage '
+                             'is more than 1.5x the average for the contig.')
     args = parser.parse_args()
 
     if os.path.isdir(args.outdir):
         print('ERROR: Output directory specified already exists! Must be a new directory. Try again.')
-        # quit(code=1)
+        quit(code=1)
     else:
         os.makedirs(args.outdir)
     # Steps in this analysis:
@@ -328,9 +357,11 @@ def main():
     # look like it's evolved really quickly, but isn't actually the case.
 
     # To resolve this: Use some sort of sliding window to find these high-density regions. Use SNVPhyl settings
-    # (only 1SNV/500bp) to start. TODO: Maybe implement some BLAST search to see if regions found are actually
+    # (only 1SNV/500bp) to start.
     multi_positions = filter_close_snvs(details_file=os.path.join(args.outdir, 'details.csv'),
-                                        outfile=os.path.join(args.outdir, 'details_filtered.csv'))
+                                        outfile=os.path.join(args.outdir, 'details_filtered.csv'),
+                                        snv_window_size=args.filter_density_window,
+                                        coverage_filter=args.coverage_filter)
 
     print('Total multi positions found: {}'.format(multi_positions))
 
