@@ -1,0 +1,5 @@
+biopython==1.72
+interop==1.1.4
+numpy==1.15.0
+OLCTools==0.3.95
+pysam==0.14.1

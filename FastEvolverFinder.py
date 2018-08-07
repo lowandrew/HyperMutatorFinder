@@ -6,6 +6,7 @@ from Bio import SeqIO
 from subprocess import PIPE
 import subprocess
 import argparse
+import logging
 import shutil  # Not used right now, but will be used for cleanup at some point
 import pysam
 import os
@@ -20,6 +21,14 @@ def write_to_logfile(logfile, out, err, cmd):
         outfile.write('Command used: {}\n\n'.format(cmd))
         outfile.write('STDOUT: {}\n\n'.format(out))
         outfile.write('STDERR: {}\n\n'.format(err))
+
+
+def run_cmd(cmd):
+    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    out = out.decode('utf-8')
+    err = err.decode('utf-8')
+    return out, err
 
 
 def trim(forward_reads, reverse_reads, outdir):
@@ -37,8 +46,7 @@ def trim(forward_reads, reverse_reads, outdir):
                                               reverse_in=reverse_reads,
                                               forward_out=forward_out,
                                               reverse_out=reverse_out)
-    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
-    out, err = p.communicate()
+    out, err = run_cmd(cmd)
     write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
                      out=out,
                      err=err,
@@ -52,8 +60,7 @@ def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
     # try to figure out what's going on.
 
     cmd = 'samtools faidx {reference_fasta}'.format(reference_fasta=reference_fasta)
-    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
-    out, err = p.communicate()
+    out, err = run_cmd(cmd)
     write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
                      out=out,
                      err=err,
@@ -67,16 +74,14 @@ def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
     # Also sort and index the bamfile so pysam will be happy with us.
     cmd = 'samtools sort {bamfile} -o {sorted_bamfile}'.format(bamfile=os.path.join(outdir, 'aligned.bam'),
                                                                sorted_bamfile=os.path.join(outdir, 'aligned_sorted.bam'))
-    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
-    out, err = p.communicate()
+    out, err = run_cmd(cmd)
     write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
                      out=out,
                      err=err,
                      cmd=cmd)
 
     cmd = 'samtools index {sorted_bamfile}'.format(sorted_bamfile=os.path.join(outdir, 'aligned_sorted.bam'))
-    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
-    out, err = p.communicate()
+    out, err = run_cmd(cmd)
     write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
                      out=out,
                      err=err,
@@ -215,7 +220,7 @@ def read_bamfile(sorted_bamfile, outfile, reference_fasta):
     bamfile_list = [sorted_bamfile] * len(contig_names)
     reference_fasta_list = [reference_fasta] * len(contig_names)
     # Name this better!
-    contig_multi_info = pool.starmap(read_contig, zip(contig_names, bamfile_list, reference_fasta_list))
+    contig_multi_info = pool.starmap(read_contig, zip(contig_names, bamfile_list, reference_fasta_list), chunksize=1)
     pool.close()
     pool.join()
     with open(outfile, 'w') as f:
@@ -305,6 +310,9 @@ def filter_close_snvs(details_file, outfile, snv_window_size, coverage_filter, m
 
 
 def main():
+    logging.basicConfig(format='\033[92m \033[1m %(asctime)s \033[0m %(message)s ',
+                        level=logging.INFO,
+                        datefmt='%Y-%m-%d %H:%M:%S')
     parser = argparse.ArgumentParser(description='Attempts to find evolutionary rate of a strain, when provided'
                                                  ' with paired-end FASTQ files and an assembly for that strain.')
     parser.add_argument('-a', '--assembly',
@@ -346,7 +354,7 @@ def main():
     args = parser.parse_args()
 
     if os.path.isdir(args.outdir):
-        print('ERROR: Output directory specified already exists! Must be a new directory. Try again.')
+        logging.error('ERROR: Output directory specified already exists! Must be a new directory. Try again.')
         quit(code=1)
     else:
         os.makedirs(args.outdir)
@@ -354,11 +362,13 @@ def main():
     # 1) Trim forward and reverse reads. I think this is a good idea, but maybe we'll end up leaving this out.
 
     # This gets us trimmed_R1.fastq.gz and trimmed_R2.fastq.gz in our temporary directory.
+    logging.info('Trimming reads...')
     trim(forward_reads=args.forward_reads,
          reverse_reads=args.reverse_reads,
          outdir=args.outdir)
     # 2) Align trimmed reads back to reference. Start off using bbmap for this, but maybe try bowtie2 as well.
 
+    logging.info('Aligning reads back to reference...')
     # We get a sorted and indexed bamfile called aligned_sorted.bam in our temporary directory.
     create_bam(forward_reads=os.path.join(args.outdir, 'trimmed_R1.fastq.gz'),
                reverse_reads=os.path.join(args.outdir, 'trimmed_R2.fastq.gz'),
@@ -366,6 +376,7 @@ def main():
                outdir=args.outdir)
     # 3) Parse through each position of the BAM file and find sites that are heterogenous-ish, indicating the colony
     # was evolving quickly.
+    logging.info('Parsing BAM file...')
     read_bamfile(sorted_bamfile=os.path.join(args.outdir, 'aligned_sorted.bam'),
                  outfile=os.path.join(args.outdir, 'details.csv'),
                  reference_fasta=args.assembly)
@@ -377,12 +388,14 @@ def main():
 
     # To resolve this: Use some sort of sliding window to find these high-density regions. Use SNVPhyl settings
     # (only 1SNV/500bp) to start.
+    logging.info('Filtering...')
     multi_positions = filter_close_snvs(details_file=os.path.join(args.outdir, 'details.csv'),
                                         outfile=os.path.join(args.outdir, 'details_filtered.csv'),
                                         snv_window_size=args.filter_density_window,
-                                        coverage_filter=args.coverage_filter)
+                                        coverage_filter=args.coverage_filter,
+                                        min_coverage=args.min_coverage)
 
-    print('Total multi positions found: {}'.format(multi_positions))
+    logging.info('Complete! Total multi positions found: {}'.format(multi_positions))
 
 
 if __name__ == '__main__':
