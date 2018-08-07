@@ -3,11 +3,11 @@
 from biotools import bbtools
 import multiprocessing
 from Bio import SeqIO
+from subprocess import PIPE
 import subprocess
 import argparse
 import shutil  # Not used right now, but will be used for cleanup at some point
 import pysam
-import math
 import os
 
 # TODO: Assemblies with spaces in headers cause problems. Make sure that gets fixed.
@@ -15,9 +15,11 @@ import os
 # and see what you can find.
 
 
-# Don't think this will actually get used. Cleanup.
-def phred_to_probability(phred_score):
-    return 1 - math.pow(10, int(phred_score) * -0.1)
+def write_to_logfile(logfile, out, err, cmd):
+    with open(logfile, 'a+') as outfile:
+        outfile.write('Command used: {}\n\n'.format(cmd))
+        outfile.write('STDOUT: {}\n\n'.format(out))
+        outfile.write('STDERR: {}\n\n'.format(err))
 
 
 def trim(forward_reads, reverse_reads, outdir):
@@ -35,8 +37,12 @@ def trim(forward_reads, reverse_reads, outdir):
                                               reverse_in=reverse_reads,
                                               forward_out=forward_out,
                                               reverse_out=reverse_out)
-    # TODO: Redirect stdout and stderr, implement logging
-    subprocess.call(cmd, shell=True)
+    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
+                     out=out,
+                     err=err,
+                     cmd=cmd)
 
 
 def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
@@ -46,8 +52,12 @@ def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
     # try to figure out what's going on.
 
     cmd = 'samtools faidx {reference_fasta}'.format(reference_fasta=reference_fasta)
-    # TODO: Redirect stdout and stderr, implement logging
-    subprocess.call(cmd, shell=True)
+    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
+                     out=out,
+                     err=err,
+                     cmd=cmd)
 
     bbtools.bbmap(reference=reference_fasta,
                   forward_in=forward_reads,
@@ -57,11 +67,20 @@ def create_bam(forward_reads, reverse_reads, reference_fasta, outdir):
     # Also sort and index the bamfile so pysam will be happy with us.
     cmd = 'samtools sort {bamfile} -o {sorted_bamfile}'.format(bamfile=os.path.join(outdir, 'aligned.bam'),
                                                                sorted_bamfile=os.path.join(outdir, 'aligned_sorted.bam'))
-    # TODO: Redirect stdout and stderr, implement logging
-    subprocess.call(cmd, shell=True)
+    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
+                     out=out,
+                     err=err,
+                     cmd=cmd)
+
     cmd = 'samtools index {sorted_bamfile}'.format(sorted_bamfile=os.path.join(outdir, 'aligned_sorted.bam'))
-    # TODO: Redirect stdout and stderr, implement logging
-    subprocess.call(cmd, shell=True)
+    p = subprocess.Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    write_to_logfile(logfile=os.path.join(outdir, 'log.txt'),
+                     out=out,
+                     err=err,
+                     cmd=cmd)
 
 
 def has_two_high_quality_bases(list_of_scores):
