@@ -309,6 +309,10 @@ def filter_close_snvs(details_file, outfile, snv_window_size, coverage_filter, m
     return multi_positions
 
 
+def cleanup(directory):
+    os.system('rm {directory}/*.fastq.gz {directory}/*bam*'.format(directory=directory))
+
+
 def main():
     logging.basicConfig(format='\033[92m \033[1m %(asctime)s \033[0m %(message)s ',
                         level=logging.INFO,
@@ -394,7 +398,7 @@ def main():
                                         snv_window_size=args.filter_density_window,
                                         coverage_filter=args.coverage_filter,
                                         min_coverage=args.min_coverage)
-
+    cleanup(args.outdir)
     logging.info('Complete! Total multi positions found: {}'.format(multi_positions))
 
 
