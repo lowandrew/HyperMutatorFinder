@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 
+from Bio.Blast.Applications import NcbiblastnCommandline
+from Bio.Blast import NCBIXML
 from biotools import bbtools
+from subprocess import PIPE
+from io import StringIO
 import multiprocessing
 from Bio import SeqIO
-from subprocess import PIPE
 import subprocess
 import argparse
 import logging
-import shutil  # Not used right now, but will be used for cleanup at some point
 import pysam
 import os
 
 # TODO: Assemblies with spaces in headers cause problems. Make sure that gets fixed.
-# Also, all of this may or may not be doable (and much faster) with regular SNP callers. Look into bcftools/etc
-# and see what you can find.
 
 
 def write_to_logfile(logfile, out, err, cmd):
@@ -230,7 +230,63 @@ def read_bamfile(sorted_bamfile, outfile, reference_fasta):
                 f.write(line)
 
 
-def filter_close_snvs(details_file, outfile, snv_window_size, coverage_filter, min_coverage):
+def check_db_presence(database):
+    """
+    Checks if a BLAST nucleotide database is present via checking for files with the proper extensions.
+    :param database: Path to Fasta file for database.
+    :return: True is all necessary files are present, False if not.
+    """
+    extensions = ['.nhr', '.nin', '.nsq']
+    is_present = True
+    for extension in extensions:
+        if not os.path.isfile(database + extension):
+            is_present = False
+    return is_present
+
+
+def make_blast_database(database, logfile='log.txt'):
+    """
+    Makes a nucleotide blast database.
+    :param database: Path to fasta file you want to turn into a database.
+    :param logfile: Logfile to write things to.
+    """
+    cmd = 'makeblastdb -in {} -dbtype nucl'.format(database)
+    out, err = run_cmd(cmd)
+    write_to_logfile(logfile, out, err, cmd)
+
+
+def check_if_phage(query_sequence, phage_fasta, outdir):
+    # 1) Check if a blast db exists. If it doesn't,
+    if check_db_presence(phage_fasta) is False:
+        make_blast_database(phage_fasta, logfile=os.path.join(outdir, 'log.txt'))
+    # 2) Run the blast - default settings should be fine.
+    blastn = NcbiblastnCommandline(db=phage_fasta, outfmt=5)
+    stdout, stderr = blastn(stdin=query_sequence)
+    # Now parse the output - assume anything with at least 80 percent identity over 80 percent of the query sequence
+    # is an actual hit. Only need to check the top hit.
+    if stdout:
+        for record in NCBIXML.parse(StringIO(stdout)):
+            for alignment in record.alignments:
+                for hsp in alignment.hsps:
+                    if hsp.align_length/len(query_sequence) > 0.8 and hsp.identities/len(query_sequence) > 0.8:
+                        return True
+                    else:
+                        return False
+        # I seem to remember coming across something that gave stdout but no alignments - this handles that case.
+        return False
+    else:
+        return False
+
+
+def extract_region(assembly, contig_name, position):
+    position = int(position)
+    contigs = SeqIO.parse(assembly, 'fasta')
+    for contig in contigs:
+        if contig.id == contig_name:
+            return str(contig.seq[position - 100: position + 100])
+
+
+def filter_close_snvs(details_file, outfile, snv_window_size, coverage_filter, min_coverage, assembly, phage_fasta, outdir):
     multi_positions = 0
     with open(details_file) as details:
         lines = details.readlines()
@@ -290,6 +346,15 @@ def filter_close_snvs(details_file, outfile, snv_window_size, coverage_filter, m
                 valid = False
                 filter_reason = 'CoverageLow'
 
+            # Yet another check: Make sure the area around the region isn't phage. That tends to cause false positives,
+            # presumable since phage are so mutate-y
+            sequence = extract_region(assembly=assembly,
+                                      contig_name=current_contig,
+                                      position=current_position)
+            if check_if_phage(query_sequence=sequence, phage_fasta=phage_fasta, outdir=outdir) is True:
+                valid = False
+                filter_reason = 'Phage'
+
             if valid:
                 multi_positions += 1
                 f.write('{},{},{},{},{},{}\n'.format(current_contig,
@@ -337,6 +402,12 @@ def main():
                         type=str,
                         required=True,
                         help='Output directory. Must not currently exist.')
+    parser.add_argument('-p', '--phage_db',
+                        type=str,
+                        required=True,
+                        help='Hits to phage cause lots of false positives. Use this option to specify a database of '
+                             'phage to be sure to exclude. The CGE databases are a good start: Head to https://cge.cbs.dtu.dk/services/data.php, '
+                             'download and extract the prophages.zip, and then cat all of those into a fasta (cat extracted_conser/*.fsa > prophages.fasta)')
     parser.add_argument('-m', '--min_coverage',
                         default=10,
                         type=int,
@@ -397,7 +468,10 @@ def main():
                                         outfile=os.path.join(args.outdir, 'details_filtered.csv'),
                                         snv_window_size=args.filter_density_window,
                                         coverage_filter=args.coverage_filter,
-                                        min_coverage=args.min_coverage)
+                                        min_coverage=args.min_coverage,
+                                        assembly=args.assembly,
+                                        phage_fasta=args.phage_db,
+                                        outdir=args.outdir)
     cleanup(args.outdir)
     logging.info('Complete! Total multi positions found: {}'.format(multi_positions))
 
