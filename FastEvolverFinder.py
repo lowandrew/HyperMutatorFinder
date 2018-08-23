@@ -4,6 +4,7 @@ from Bio.Blast.Applications import NcbiblastnCommandline
 from Bio.Blast import NCBIXML
 from biotools import bbtools
 from subprocess import PIPE
+from biotools import mash
 from io import StringIO
 import multiprocessing
 from Bio import SeqIO
@@ -14,6 +15,8 @@ import pysam
 import os
 
 # TODO: Assemblies with spaces in headers cause problems. Make sure that gets fixed.
+# TODO: Automate phage-db download.
+# TODO: Automate refseq sketch
 
 
 def write_to_logfile(logfile, out, err, cmd):
@@ -128,13 +131,13 @@ def find_if_multibase(column):
                 base_dict[base] += 1
             else:
                 base_dict[base] = 1
-    # Assume that things that are truly indicative of fast evolution at least 20 percent of population?
+    # Assume that things that are truly indicative of fast evolution at least 10 percent of population?
     # Assume things that only have count of 1 are sequencing errors.
     appropriate_ratio = True
     if len(base_dict) == 1:
         appropriate_ratio = False
     for base in base_dict:
-        if base_dict[base]/column.n >= 0.8 or base_dict[base]/column.n <= 0.2 or base_dict[base] == 1:
+        if base_dict[base]/column.n >= 0.9 or base_dict[base]/column.n <= 0.1 or base_dict[base] == 1:
             appropriate_ratio = False
     if appropriate_ratio is False:
         base_dict = dict()
@@ -264,7 +267,7 @@ def check_if_phage(query_sequence, phage_fasta, outdir):
     stdout, stderr = blastn(stdin=query_sequence)
     # Now parse the output - assume anything with at least 80 percent identity over 80 percent of the query sequence
     # is an actual hit. Only need to check the top hit.
-    if stdout:
+    if stdout and not stdout.startswith('\n'):
         for record in NCBIXML.parse(StringIO(stdout)):
             for alignment in record.alignments:
                 for hsp in alignment.hsps:
@@ -378,18 +381,58 @@ def cleanup(directory):
     os.system('rm {directory}/*.fastq.gz {directory}/*bam*'.format(directory=directory))
 
 
+def find_closest_refseq_genome(forward_reads, refseq_sketch, outdir):
+    print('FINDING CLOSEST REFSEQ GENOME')
+    out_file = os.path.join(outdir, 'distances.tab')
+    mash.dist(forward_reads, refseq_sketch, output_file=out_file)
+    closest_genome = 'NA'
+    closest_distance = 10000
+    mash_results = mash.read_mash_output(result_file=out_file)
+    for result in mash_results:
+        if result.distance < closest_distance:
+            print(result.distance)
+            print(result.query)
+            closest_genome = result.query
+            closest_distance = result.distance
+    return closest_genome.replace('_genomic.fna', '')
+
+
+def download_assembly(gca, outdir):
+    one = gca.split('_')[1].split('.')[0][0:3]
+    two = gca.split('_')[1].split('.')[0][3:6]
+    three = gca.split('_')[1].split('.')[0][6:9]
+    cmd = 'wget ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/{one}/{two}/{three}/{gca}/{gca}_genomic.fna.gz ' \
+          '-O {output}'.format(one=one,
+                               two=two,
+                               three=three,
+                               gca=gca,
+                               output=os.path.join(outdir, 'reference.fasta.gz'))
+    print(cmd)
+    os.system(cmd)
+
+
+def uncompress_and_rename_headers(fasta, outdir):
+    cmd = 'gunzip {fasta}'.format(fasta=fasta)
+    os.system(cmd)
+    reference_fasta = fasta.replace('.gz', '')
+    output_fasta = os.path.join(outdir, 'ref.fasta')
+    contig_count = 1
+    with open(output_fasta, 'w') as f:
+        for contig in SeqIO.parse(reference_fasta, 'fasta'):
+            f.write('>Contig{}\n'.format(contig_count))
+            f.write(str(contig.seq) + '\n')
+
+
 def main():
     logging.basicConfig(format='\033[92m \033[1m %(asctime)s \033[0m %(message)s ',
                         level=logging.INFO,
                         datefmt='%Y-%m-%d %H:%M:%S')
     parser = argparse.ArgumentParser(description='Attempts to find evolutionary rate of a strain, when provided'
                                                  ' with paired-end FASTQ files and an assembly for that strain.')
-    parser.add_argument('-a', '--assembly',
+    parser.add_argument('-r', '--refseq_sketch',
                         type=str,
                         required=True,
-                        help='Full path to your FASTA-formatted assembly. Only works with SPAdes assemblies right now.'
-                             ' SKESA causes breakpoints at most sites we\'re looking for. Other assemblers have'
-                             ' not been tested.')
+                        help='Full path to complete_refseq_genomes.msh or whatever it was I made it')
     parser.add_argument('-1', '--forward_reads',
                         type=str,
                         required=True,
@@ -434,27 +477,30 @@ def main():
     else:
         os.makedirs(args.outdir)
     # Steps in this analysis:
-    # 1) Trim forward and reverse reads. I think this is a good idea, but maybe we'll end up leaving this out.
-
-    # This gets us trimmed_R1.fastq.gz and trimmed_R2.fastq.gz in our temporary directory.
+    # Find closest refseq genome.
+    gca = find_closest_refseq_genome(args.forward_reads, args.refseq_sketch, args.outdir)
+    download_assembly(gca, args.outdir)
+    uncompress_and_rename_headers(os.path.join(args.outdir, 'reference.fasta.gz'), args.outdir)
+    # 1) Trim forward and reverse reads.
+    # This gets us trimmed_R1.fastq.gz and trimmed_R2.fastq.gz in our output directory.
     logging.info('Trimming reads...')
     trim(forward_reads=args.forward_reads,
          reverse_reads=args.reverse_reads,
          outdir=args.outdir)
-    # 2) Align trimmed reads back to reference. Start off using bbmap for this, but maybe try bowtie2 as well.
+    # 2) Align trimmed reads back to reference, using BBMap.
 
     logging.info('Aligning reads back to reference...')
     # We get a sorted and indexed bamfile called aligned_sorted.bam in our temporary directory.
     create_bam(forward_reads=os.path.join(args.outdir, 'trimmed_R1.fastq.gz'),
                reverse_reads=os.path.join(args.outdir, 'trimmed_R2.fastq.gz'),
-               reference_fasta=args.assembly,
+               reference_fasta=os.path.join(args.outdir, 'ref.fasta'),
                outdir=args.outdir)
     # 3) Parse through each position of the BAM file and find sites that are heterogenous-ish, indicating the colony
     # was evolving quickly.
     logging.info('Parsing BAM file...')
     read_bamfile(sorted_bamfile=os.path.join(args.outdir, 'aligned_sorted.bam'),
                  outfile=os.path.join(args.outdir, 'details.csv'),
-                 reference_fasta=args.assembly)
+                 reference_fasta=os.path.join(args.outdir, 'ref.fasta'))
 
     # This gets us a list of sites that are appropriately heterogenous (pending me figuring out what cutoffs should
     # actually be getting used). A lot of these sites tend to cluster together - my interpretation is that this is
@@ -463,13 +509,16 @@ def main():
 
     # To resolve this: Use some sort of sliding window to find these high-density regions. Use SNVPhyl settings
     # (only 1SNV/500bp) to start.
+    # Also have lots of other filters - don't allow phage sequence, or things that fall below minimum coverage,
+    # or things that have too much coverage relative to the rest of their contig - these seem to be the result of
+    # having more than two genes that are close to identical, but SPAdes assembles them into one gene with high coverage
     logging.info('Filtering...')
     multi_positions = filter_close_snvs(details_file=os.path.join(args.outdir, 'details.csv'),
                                         outfile=os.path.join(args.outdir, 'details_filtered.csv'),
                                         snv_window_size=args.filter_density_window,
                                         coverage_filter=args.coverage_filter,
                                         min_coverage=args.min_coverage,
-                                        assembly=args.assembly,
+                                        assembly=os.path.join(args.outdir, 'ref.fasta'),
                                         phage_fasta=args.phage_db,
                                         outdir=args.outdir)
     cleanup(args.outdir)
